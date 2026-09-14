@@ -1,309 +1,285 @@
 from flask import Flask, request, jsonify, render_template_string
-import time
 import os
+import time
+import math
 
 app = Flask(__name__)
 
+# ============================================================
+# RYU V2 SIGNAL DASHBOARD
+# Signal-only dashboard — NO automatic trade placement
+# ============================================================
+
+FEED_TOKEN = os.getenv("RYU_FEED_TOKEN", "")
+DEFAULT_ASSET = os.getenv("RYU_DEFAULT_ASSET", "EURUSD_otc")
+EXPIRY_SECONDS = int(os.getenv("RYU_EXPIRY_SECONDS", "300"))
+MIN_CONFIDENCE = float(os.getenv("RYU_MIN_CONFIDENCE", "78"))
+
 STATE = {
-    "asset": "EURUSD_otc",
+    "asset": DEFAULT_ASSET,
     "price": None,
     "signal": "WAIT",
     "confidence": 0,
     "entry": None,
     "entry_window": 0,
-    "candles": 0,
+    "expiry_seconds": EXPIRY_SECONDS,
     "feed": "DISCONNECTED",
     "last_update": 0,
+    "candles": 0,
+    "open": None,
+    "high": None,
+    "low": None,
+    "close": None,
+    "payout": 0,
+    "message": "Waiting for Pocket Option feed..."
 }
 
+# ============================================================
+# SIMPLE MARKET STATE
+# ============================================================
 
-HTML = """
+PRICE_HISTORY = {}
+CANDLE_HISTORY = {}
+
+
+def clean_number(value):
+    try:
+        value = float(value)
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def calculate_signal(asset):
+    """
+    Signal engine for dashboard display.
+
+    This is intentionally conservative:
+    insufficient data = WAIT.
+    """
+
+    prices = PRICE_HISTORY.get(asset, [])
+
+    if len(prices) < 20:
+        return "WAIT", 0
+
+    recent = prices[-20:]
+
+    # Short and long averages
+    short = sum(recent[-5:]) / 5
+    long = sum(recent[-20:]) / 20
+
+    # Recent momentum
+    momentum = recent[-1] - recent[-6]
+
+    if long == 0:
+        return "WAIT", 0
+
+    distance = abs(short - long) / abs(long) * 100000
+
+    confidence = 50
+
+    if short > long:
+        confidence += min(25, distance * 2)
+
+    elif short < long:
+        confidence += min(25, distance * 2)
+
+    if momentum > 0:
+        confidence += 15
+
+    elif momentum < 0:
+        confidence += 15
+
+    confidence = max(0, min(99, round(confidence)))
+
+    if short > long and momentum > 0 and confidence >= MIN_CONFIDENCE:
+        return "CALL", confidence
+
+    if short < long and momentum < 0 and confidence >= MIN_CONFIDENCE:
+        return "PUT", confidence
+
+    return "WAIT", confidence
+
+
+def process_price(asset, price):
+    if not asset or price is None:
+        return
+
+    if asset not in PRICE_HISTORY:
+        PRICE_HISTORY[asset] = []
+
+    PRICE_HISTORY[asset].append(price)
+
+    # Keep memory small
+    PRICE_HISTORY[asset] = PRICE_HISTORY[asset][-200:]
+
+    signal, confidence = calculate_signal(asset)
+
+    STATE["signal"] = signal
+    STATE["confidence"] = confidence
+
+    if signal in ("CALL", "PUT"):
+        STATE["entry"] = price
+        STATE["entry_window"] = 12
+        STATE["message"] = "ENTRY WINDOW ACTIVE"
+    else:
+        STATE["message"] = "Waiting for high-confidence setup..."
+
+
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+def authorized(req):
+    """
+    If RYU_FEED_TOKEN is configured, require it.
+
+    Accepted:
+      Authorization: Bearer YOUR_TOKEN
+    OR
+      X-RYU-TOKEN: YOUR_TOKEN
+    """
+
+    if not FEED_TOKEN:
+        return True
+
+    auth = req.headers.get("Authorization", "")
+
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+
+        if token == FEED_TOKEN:
+            return True
+
+    header_token = req.headers.get("X-RYU-TOKEN", "")
+
+    if header_token == FEED_TOKEN:
+        return True
+
+    # Also allow token in JSON body
+    try:
+        body = req.get_json(silent=True) or {}
+
+        if body.get("token") == FEED_TOKEN:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+# ============================================================
+# HOME / DASHBOARD
+# ============================================================
+
+HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>RYU V2 Signal Intelligence</title>
-    <style>
-        body {
-            margin: 0;
-            background: #07120b;
-            color: white;
-            font-family: Arial, sans-serif;
-        }
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-        .top {
-            padding: 18px;
-            background: #101b14;
-            border-bottom: 1px solid #23452d;
-        }
+<title>RYU V2 Signal Dashboard</title>
 
-        .title {
-            font-size: 25px;
-            font-weight: bold;
-            color: #70ff8a;
-        }
+<style>
 
-        .sub {
-            color: #9fb3a3;
-            margin-top: 4px;
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap: 12px;
-            padding: 15px;
-        }
-
-        .card {
-            background: #102016;
-            border: 1px solid #285335;
-            border-radius: 12px;
-            padding: 16px;
-        }
-
-        .label {
-            color: #9caf9f;
-            font-size: 13px;
-        }
-
-        .value {
-            font-size: 23px;
-            font-weight: bold;
-            margin-top: 7px;
-        }
-
-        .signal {
-            font-size: 38px;
-            font-weight: bold;
-            text-align: center;
-            padding: 25px;
-            margin: 15px;
-            border-radius: 15px;
-            background: #14291a;
-            border: 1px solid #397348;
-        }
-
-        .feed {
-            text-align: center;
-            padding: 10px;
-            color: #ffcc66;
-        }
-
-        .section {
-            padding: 15px;
-        }
-
-        button {
-            width: 100%;
-            padding: 14px;
-            border: 0;
-            border-radius: 10px;
-            background: #238636;
-            color: white;
-            font-size: 16px;
-            font-weight: bold;
-        }
-
-        pre {
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-    </style>
-</head>
-
-<body>
-
-<div class="top">
-    <div class="title">🔥 RYU V2</div>
-    <div class="sub">Signal Intelligence Dashboard</div>
-</div>
-
-<div class="feed" id="feed">Feed: DISCONNECTED</div>
-
-<div class="signal" id="signal">WAIT</div>
-
-<div class="grid">
-
-    <div class="card">
-        <div class="label">Asset</div>
-        <div class="value" id="asset">EURUSD_otc</div>
-    </div>
-
-    <div class="card">
-        <div class="label">Price</div>
-        <div class="value" id="price">--</div>
-    </div>
-
-    <div class="card">
-        <div class="label">Confidence</div>
-        <div class="value" id="confidence">0%</div>
-    </div>
-
-    <div class="card">
-        <div class="label">Entry</div>
-        <div class="value" id="entry">--</div>
-    </div>
-
-    <div class="card">
-        <div class="label">Entry Window</div>
-        <div class="value" id="window">--</div>
-    </div>
-
-    <div class="card">
-        <div class="label">Candles</div>
-        <div class="value" id="candles">0</div>
-    </div>
-
-</div>
-
-<div class="section">
-    <button onclick="refresh()">REFRESH SIGNAL</button>
-</div>
-
-<div class="section">
-    <div class="card">
-        <b>Live State</b>
-        <pre id="raw">Loading...</pre>
-    </div>
-</div>
-
-<script>
-async function refresh() {
-    try {
-        const response = await fetch("/api/state");
-        const data = await response.json();
-
-        document.getElementById("asset").textContent = data.asset || "--";
-        document.getElementById("price").textContent =
-            data.price === null ? "--" : data.price;
-
-        document.getElementById("confidence").textContent =
-            (data.confidence || 0) + "%";
-
-        document.getElementById("entry").textContent =
-            data.entry === null ? "--" : data.entry;
-
-        document.getElementById("window").textContent =
-            data.entry_window > 0 ? data.entry_window + " sec" : "--";
-
-        document.getElementById("candles").textContent =
-            data.candles || 0;
-
-        document.getElementById("feed").textContent =
-            "Feed: " + (data.feed || "DISCONNECTED");
-
-        document.getElementById("signal").textContent =
-            data.signal || "WAIT";
-
-        document.getElementById("raw").textContent =
-            JSON.stringify(data, null, 2);
-
-    } catch (error) {
-        document.getElementById("feed").textContent =
-            "Feed: SERVER ERROR";
-    }
+* {
+    box-sizing: border-box;
 }
 
-refresh();
-setInterval(refresh, 2000);
-</script>
+body {
+    margin: 0;
+    background: #06110b;
+    color: white;
+    font-family: Arial, Helvetica, sans-serif;
+}
 
-</body>
-</html>
-"""
+.header {
+    padding: 18px;
+    background: linear-gradient(90deg,#07150c,#0d2a17,#07150c);
+    border-bottom: 2px solid #19ff72;
+    text-align: center;
+}
 
+.logo {
+    font-size: 30px;
+    font-weight: 900;
+    color: #19ff72;
+    letter-spacing: 3px;
+}
 
-@app.route("/")
-def home():
-    return render_template_string(HTML)
+.subtitle {
+    color: #9affba;
+    font-size: 12px;
+    margin-top: 5px;
+    letter-spacing: 2px;
+}
 
+.statusbar {
+    display: flex;
+    gap: 10px;
+    padding: 12px;
+    overflow-x: auto;
+    background: #08170d;
+}
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "service": "RYU V2"
-    })
+.status {
+    min-width: 130px;
+    padding: 10px;
+    border: 1px solid #174d2b;
+    border-radius: 8px;
+    background: #0b2113;
+}
 
+.status-title {
+    color: #80a88d;
+    font-size: 11px;
+}
 
-@app.route("/api/state")
-def api_state():
-    state = dict(STATE)
+.status-value {
+    font-size: 16px;
+    font-weight: bold;
+    margin-top: 4px;
+}
 
-    if state["last_update"]:
-        age = time.time() - state["last_update"]
+.live {
+    color: #19ff72;
+}
 
-        if age > 15:
-            state["feed"] = "STALE"
+.dead {
+    color: #ff4d4d;
+}
 
-    return jsonify(state)
+.container {
+    max-width: 1100px;
+    margin: auto;
+    padding: 15px;
+}
 
+.card {
+    background: linear-gradient(145deg,#0b2113,#07150c);
+    border: 1px solid #19562f;
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 15px;
+    box-shadow: 0 0 25px rgba(0,255,100,.06);
+}
 
-@app.route("/api/feed", methods=["POST"])
-def api_feed():
-    token = os.getenv("RYU_FEED_TOKEN", "")
+.asset {
+    color: #9affba;
+    font-size: 14px;
+}
 
-    supplied = request.headers.get("X-RYU-TOKEN", "")
+.price {
+    font-size: 38px;
+    font-weight: 900;
+    margin-top: 8px;
+}
 
-    if token and supplied != token:
-        return jsonify({
-            "ok": False,
-            "error": "Invalid feed token"
-        }), 401
-
-    data = request.get_json(silent=True)
-
-    if not isinstance(data, dict):
-        return jsonify({
-            "ok": False,
-            "error": "JSON object required"
-        }), 400
-
-    for key in [
-        "asset",
-        "price",
-        "signal",
-        "confidence",
-        "entry",
-        "entry_window",
-        "candles"
-    ]:
-        if key in data:
-            STATE[key] = data[key]
-
-    STATE["feed"] = "LIVE"
-    STATE["last_update"] = time.time()
-
-    return jsonify({
-        "ok": True,
-        "state": STATE
-    })
-
-
-@app.route("/api/ping")
-def ping():
-    return jsonify({
-        "ok": True,
-        "message": "RYU V2 server is running"
-    })
-
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        "error": "Not Found",
-        "message": "RYU V2 route does not exist",
-        "available_routes": [
-            "/",
-            "/health",
-            "/api/state",
-            "/api/ping",
-            "/api/feed"
-        ]
-    }), 404
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+.signal-box {
+    text-align: center;
+    padding: 25px;
+    border-radius: 12px;
+    background: #061
