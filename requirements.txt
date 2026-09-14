@@ -4,4 +4,4 @@ requests
 websocket-client
 pandas
 numpy
-yfinance
+
