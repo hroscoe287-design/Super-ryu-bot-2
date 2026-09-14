@@ -1,413 +1,309 @@
-import os
-import json
+from flask import Flask, request, jsonify, render_template_string
 import time
-import math
-import random
-import threading
-from datetime import datetime, timezone
-
-import websocket
-import numpy as np
-import pandas as pd
-from flask import Flask, jsonify, request, render_template_string
-
+import os
 
 app = Flask(__name__)
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-PO_SERVER = os.getenv(
-    "PO_SERVER",
-    "wss://try-demo-eu.po.market/socket.io/?EIO=4&transport=websocket"
-)
-
-DEFAULT_ASSET = os.getenv("RYU_DEFAULT_ASSET", "EURUSD_otc")
-DEFAULT_PERIOD = int(os.getenv("RYU_PERIOD_SECONDS", "60"))
-
-FEED_TOKEN = os.getenv("RYU_FEED_TOKEN", "")
-DEMO_BALANCE = 50000
-
-STALE_SECONDS = 8
-CANDLE_SECONDS = DEFAULT_PERIOD
-
-ASSETS = [
-    ("EURUSD_otc", "EUR/USD OTC"),
-    ("GBPUSD_otc", "GBP/USD OTC"),
-    ("USDJPY_otc", "USD/JPY OTC"),
-    ("AUDUSD_otc", "AUD/USD OTC"),
-    ("USDCAD_otc", "USD/CAD OTC"),
-    ("USDCHF_otc", "USD/CHF OTC"),
-    ("NZDUSD_otc", "NZD/USD OTC"),
-    ("EURJPY_otc", "EUR/JPY OTC"),
-    ("GBPJPY_otc", "GBP/JPY OTC"),
-
-    ("BTCUSD_otc", "BTC/USD OTC"),
-    ("ETHUSD_otc", "ETH/USD OTC"),
-    ("SOL-USD_otc", "SOL/USD OTC"),
-    ("XRP_otc", "XRP/USD OTC"),
-    ("DOGE_otc", "DOGE/USD OTC"),
-
-    ("MSFT_otc", "Microsoft OTC"),
-    ("TSLA_otc", "Tesla OTC"),
-    ("AMZN_otc", "Amazon OTC"),
-    ("NFLX_otc", "Netflix OTC"),
-    ("GME_otc", "GameStop OTC"),
-    ("VISA_otc", "Visa OTC"),
-
-    ("SP500_otc", "S&P 500 OTC"),
-    ("NASUSD_otc", "Nasdaq OTC"),
-    ("DJI30_otc", "Dow Jones OTC"),
-    ("JPN225_otc", "Japan 225 OTC"),
-    ("F40EUR_otc", "France 40 OTC"),
-    ("E50EUR_otc", "Euro 50 OTC"),
-
-    ("UKBrent_otc", "UK Brent OTC"),
-    ("USCrude_otc", "US Crude OTC"),
-    ("XAUUSD_otc", "Gold OTC"),
-    ("XAGUSD_otc", "Silver OTC"),
-    ("XNGUSD_otc", "Natural Gas OTC"),
-]
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-state_lock = threading.Lock()
-
-state = {
-    "asset": DEFAULT_ASSET,
-    "period": DEFAULT_PERIOD,
-
-    "connected": False,
-    "authenticated": False,
-    "subscribed": False,
-
+STATE = {
+    "asset": "EURUSD_otc",
     "price": None,
-    "last_tick": None,
-    "last_tick_text": "--",
-
-    "ticks": 0,
-    "candles": [],
-
     "signal": "WAIT",
     "confidence": 0,
-    "reason": "Waiting for market data",
-
-    "ema9": None,
-    "ema20": None,
-    "ema50": None,
-    "rsi": None,
-    "macd": None,
-    "macd_signal": None,
-    "cci": None,
-    "bb_upper": None,
-    "bb_middle": None,
-    "bb_lower": None,
-
-    "entry_price": None,
-    "entry_time": None,
-    "entry_deadline": None,
-
-    "feed_message": "CONNECTING",
-    "server_time": None,
+    "entry": None,
+    "entry_window": 0,
+    "candles": 0,
+    "feed": "DISCONNECTED",
+    "last_update": 0,
 }
 
 
-# ============================================================
-# DEMO TOKEN
-# ============================================================
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RYU V2 Signal Intelligence</title>
+    <style>
+        body {
+            margin: 0;
+            background: #07120b;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
 
-def make_demo_token():
-    if FEED_TOKEN and len(FEED_TOKEN) >= 10:
-        return FEED_TOKEN
+        .top {
+            padding: 18px;
+            background: #101b14;
+            border-bottom: 1px solid #23452d;
+        }
 
-    chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return "".join(random.choice(chars) for _ in range(10))
+        .title {
+            font-size: 25px;
+            font-weight: bold;
+            color: #70ff8a;
+        }
 
+        .sub {
+            color: #9fb3a3;
+            margin-top: 4px;
+        }
 
-DEMO_TOKEN = make_demo_token()
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 12px;
+            padding: 15px;
+        }
 
+        .card {
+            background: #102016;
+            border: 1px solid #285335;
+            border-radius: 12px;
+            padding: 16px;
+        }
 
-# ============================================================
-# HELPERS
-# ============================================================
+        .label {
+            color: #9caf9f;
+            font-size: 13px;
+        }
 
-def now_unix():
-    return time.time()
+        .value {
+            font-size: 23px;
+            font-weight: bold;
+            margin-top: 7px;
+        }
 
+        .signal {
+            font-size: 38px;
+            font-weight: bold;
+            text-align: center;
+            padding: 25px;
+            margin: 15px;
+            border-radius: 15px;
+            background: #14291a;
+            border: 1px solid #397348;
+        }
 
-def format_price(value):
-    if value is None:
-        return "--"
+        .feed {
+            text-align: center;
+            padding: 10px;
+            color: #ffcc66;
+        }
 
-    try:
-        value = float(value)
+        .section {
+            padding: 15px;
+        }
 
-        if value >= 1000:
-            return f"{value:,.2f}"
+        button {
+            width: 100%;
+            padding: 14px;
+            border: 0;
+            border-radius: 10px;
+            background: #238636;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+        }
 
-        if value >= 10:
-            return f"{value:.3f}"
+        pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+    </style>
+</head>
 
-        return f"{value:.5f}"
+<body>
 
-    except Exception:
-        return "--"
+<div class="top">
+    <div class="title">🔥 RYU V2</div>
+    <div class="sub">Signal Intelligence Dashboard</div>
+</div>
 
+<div class="feed" id="feed">Feed: DISCONNECTED</div>
 
-def period_label(seconds):
-    mapping = {
-        1: "1s",
-        5: "5s",
-        10: "10s",
-        15: "15s",
-        30: "30s",
-        60: "1m",
-        120: "2m",
-        180: "3m",
-        300: "5m",
-        600: "10m",
-        900: "15m",
-        1800: "30m",
-        3600: "1h",
-        14400: "4h",
-        86400: "1D",
+<div class="signal" id="signal">WAIT</div>
+
+<div class="grid">
+
+    <div class="card">
+        <div class="label">Asset</div>
+        <div class="value" id="asset">EURUSD_otc</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Price</div>
+        <div class="value" id="price">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Confidence</div>
+        <div class="value" id="confidence">0%</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Entry</div>
+        <div class="value" id="entry">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Entry Window</div>
+        <div class="value" id="window">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Candles</div>
+        <div class="value" id="candles">0</div>
+    </div>
+
+</div>
+
+<div class="section">
+    <button onclick="refresh()">REFRESH SIGNAL</button>
+</div>
+
+<div class="section">
+    <div class="card">
+        <b>Live State</b>
+        <pre id="raw">Loading...</pre>
+    </div>
+</div>
+
+<script>
+async function refresh() {
+    try {
+        const response = await fetch("/api/state");
+        const data = await response.json();
+
+        document.getElementById("asset").textContent = data.asset || "--";
+        document.getElementById("price").textContent =
+            data.price === null ? "--" : data.price;
+
+        document.getElementById("confidence").textContent =
+            (data.confidence || 0) + "%";
+
+        document.getElementById("entry").textContent =
+            data.entry === null ? "--" : data.entry;
+
+        document.getElementById("window").textContent =
+            data.entry_window > 0 ? data.entry_window + " sec" : "--";
+
+        document.getElementById("candles").textContent =
+            data.candles || 0;
+
+        document.getElementById("feed").textContent =
+            "Feed: " + (data.feed || "DISCONNECTED");
+
+        document.getElementById("signal").textContent =
+            data.signal || "WAIT";
+
+        document.getElementById("raw").textContent =
+            JSON.stringify(data, null, 2);
+
+    } catch (error) {
+        document.getElementById("feed").textContent =
+            "Feed: SERVER ERROR";
     }
+}
 
-    return mapping.get(seconds, f"{seconds}s")
+refresh();
+setInterval(refresh, 2000);
+</script>
 
-
-def current_candle_bucket(timestamp, seconds):
-    return int(timestamp // seconds) * seconds
-
-
-# ============================================================
-# CANDLE BUILDER
-# ============================================================
-
-def add_tick(asset, timestamp, price):
-    global state
-
-    if asset != state["asset"]:
-        return
-
-    try:
-        timestamp = float(timestamp)
-        price = float(price)
-    except Exception:
-        return
-
-    with state_lock:
-        state["price"] = price
-        state["last_tick"] = timestamp
-        state["last_tick_text"] = datetime.fromtimestamp(
-            timestamp,
-            tz=timezone.utc
-        ).strftime("%H:%M:%S UTC")
-
-        state["ticks"] += 1
-        state["server_time"] = timestamp
-
-        bucket = current_candle_bucket(
-            timestamp,
-            state["period"]
-        )
-
-        candles = state["candles"]
-
-        if not candles or candles[-1]["time"] != bucket:
-            candles.append({
-                "time": bucket,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-            })
-
-        else:
-            candle = candles[-1]
-
-            candle["high"] = max(candle["high"], price)
-            candle["low"] = min(candle["low"], price)
-            candle["close"] = price
-
-        # Keep enough history without allowing unlimited memory growth.
-        if len(candles) > 500:
-            del candles[:-500]
-
-        calculate_indicators_locked()
+</body>
+</html>
+"""
 
 
-# ============================================================
-# INDICATORS
-# ============================================================
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
-def calculate_indicators_locked():
-    candles = state["candles"]
 
-    if len(candles) < 20:
-        state["signal"] = "WAIT"
-        state["confidence"] = 0
-        state["reason"] = (
-            f"Building candles "
-            f"({len(candles)}/50)"
-        )
-        return
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "RYU V2"
+    })
 
-    df = pd.DataFrame(candles)
 
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
+@app.route("/api/state")
+def api_state():
+    state = dict(STATE)
 
-    # EMA
-    df["ema9"] = close.ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    if state["last_update"]:
+        age = time.time() - state["last_update"]
 
-    df["ema20"] = close.ewm(
-        span=20,
-        adjust=False
-    ).mean()
+        if age > 15:
+            state["feed"] = "STALE"
 
-    df["ema50"] = close.ewm(
-        span=50,
-        adjust=False
-    ).mean()
+    return jsonify(state)
 
-    # RSI
-    delta = close.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+@app.route("/api/feed", methods=["POST"])
+def api_feed():
+    token = os.getenv("RYU_FEED_TOKEN", "")
 
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
+    supplied = request.headers.get("X-RYU-TOKEN", "")
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    if token and supplied != token:
+        return jsonify({
+            "ok": False,
+            "error": "Invalid feed token"
+        }), 401
 
-    df["rsi"] = 100 - (
-        100 / (1 + rs)
-    )
+    data = request.get_json(silent=True)
 
-    # MACD
-    ema12 = close.ewm(
-        span=12,
-        adjust=False
-    ).mean()
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "JSON object required"
+        }), 400
 
-    ema26 = close.ewm(
-        span=26,
-        adjust=False
-    ).mean()
+    for key in [
+        "asset",
+        "price",
+        "signal",
+        "confidence",
+        "entry",
+        "entry_window",
+        "candles"
+    ]:
+        if key in data:
+            STATE[key] = data[key]
 
-    df["macd"] = ema12 - ema26
+    STATE["feed"] = "LIVE"
+    STATE["last_update"] = time.time()
 
-    df["macd_signal"] = df["macd"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    return jsonify({
+        "ok": True,
+        "state": STATE
+    })
 
-    # CCI
-    typical = (high + low + close) / 3
 
-    sma20 = typical.rolling(20).mean()
+@app.route("/api/ping")
+def ping():
+    return jsonify({
+        "ok": True,
+        "message": "RYU V2 server is running"
+    })
 
-    mean_dev = typical.rolling(20).apply(
-        lambda x: np.mean(
-            np.abs(x - np.mean(x))
-        ),
-        raw=True
-    )
 
-    df["cci"] = (
-        (typical - sma20) /
-        (0.015 * mean_dev.replace(0, np.nan))
-    )
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        "error": "Not Found",
+        "message": "RYU V2 route does not exist",
+        "available_routes": [
+            "/",
+            "/health",
+            "/api/state",
+            "/api/ping",
+            "/api/feed"
+        ]
+    }), 404
 
-    # Bollinger Bands
-    bb_middle = close.rolling(20).mean()
-    bb_std = close.rolling(20).std()
 
-    df["bb_middle"] = bb_middle
-    df["bb_upper"] = bb_middle + (2 * bb_std)
-    df["bb_lower"] = bb_middle - (2 * bb_std)
-
-    latest = df.iloc[-1]
-
-    values = [
-        latest["ema9"],
-        latest["ema20"],
-        latest["ema50"],
-        latest["rsi"],
-        latest["macd"],
-        latest["macd_signal"],
-        latest["cci"],
-        latest["bb_upper"],
-        latest["bb_middle"],
-        latest["bb_lower"],
-    ]
-
-    if any(pd.isna(v) for v in values):
-        state["signal"] = "WAIT"
-        state["confidence"] = 0
-        state["reason"] = "Indicators warming up"
-        return
-
-    state["ema9"] = float(latest["ema9"])
-    state["ema20"] = float(latest["ema20"])
-    state["ema50"] = float(latest["ema50"])
-
-    state["rsi"] = float(latest["rsi"])
-
-    state["macd"] = float(latest["macd"])
-    state["macd_signal"] = float(
-        latest["macd_signal"]
-    )
-
-    state["cci"] = float(latest["cci"])
-
-    state["bb_upper"] = float(latest["bb_upper"])
-    state["bb_middle"] = float(latest["bb_middle"])
-    state["bb_lower"] = float(latest["bb_lower"])
-
-    # ========================================================
-    # SIGNAL ENGINE
-    # ========================================================
-
-    call_score = 0
-    put_score = 0
-    reasons_call = []
-    reasons_put = []
-
-    current = float(latest["close"])
-
-    # EMA trend
-    if latest["ema9"] > latest["ema20"]:
-        call_score += 15
-        reasons_call.append("EMA9 > EMA20")
-
-    elif latest["ema9"] < latest["ema20"]:
-        put_score += 15
-        reasons_put.append("EMA9 < EMA20")
-
-    if latest["ema20"] > latest["ema50"]:
-        call_score += 15
-        reasons_call.append("EMA20 > EMA50")
-
-    elif latest["ema20"] < latest["ema50"]:
-        put_score += 15
-        reasons_put.append("EMA20 < EMA50")
-
-    # MACD
-    if latest["macd"] > latest["macd_signal"]:
-        call_score += 15
-        reasons_call.append("MACD bullish")
-
-    elif latest["macd"] < latest["macd_signal"]:
-        put_score += 15
-        reasons
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
