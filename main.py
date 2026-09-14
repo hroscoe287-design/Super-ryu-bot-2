@@ -1,285 +1,388 @@
 from flask import Flask, request, jsonify, render_template_string
-import os
 import time
-import math
+import os
 
 app = Flask(__name__)
 
-# ============================================================
-# RYU V2 SIGNAL DASHBOARD
-# Signal-only dashboard — NO automatic trade placement
-# ============================================================
-
-FEED_TOKEN = os.getenv("RYU_FEED_TOKEN", "")
-DEFAULT_ASSET = os.getenv("RYU_DEFAULT_ASSET", "EURUSD_otc")
-EXPIRY_SECONDS = int(os.getenv("RYU_EXPIRY_SECONDS", "300"))
-MIN_CONFIDENCE = float(os.getenv("RYU_MIN_CONFIDENCE", "78"))
-
 STATE = {
-    "asset": DEFAULT_ASSET,
+    "asset": "EURUSD_otc",
     "price": None,
     "signal": "WAIT",
     "confidence": 0,
     "entry": None,
     "entry_window": 0,
-    "expiry_seconds": EXPIRY_SECONDS,
+    "candles": 0,
     "feed": "DISCONNECTED",
     "last_update": 0,
-    "candles": 0,
-    "open": None,
-    "high": None,
-    "low": None,
-    "close": None,
-    "payout": 0,
-    "message": "Waiting for Pocket Option feed..."
 }
 
-# ============================================================
-# SIMPLE MARKET STATE
-# ============================================================
 
-PRICE_HISTORY = {}
-CANDLE_HISTORY = {}
-
-
-def clean_number(value):
-    try:
-        value = float(value)
-        if math.isnan(value) or math.isinf(value):
-            return None
-        return value
-    except Exception:
-        return None
-
-
-def calculate_signal(asset):
-    """
-    Signal engine for dashboard display.
-
-    This is intentionally conservative:
-    insufficient data = WAIT.
-    """
-
-    prices = PRICE_HISTORY.get(asset, [])
-
-    if len(prices) < 20:
-        return "WAIT", 0
-
-    recent = prices[-20:]
-
-    # Short and long averages
-    short = sum(recent[-5:]) / 5
-    long = sum(recent[-20:]) / 20
-
-    # Recent momentum
-    momentum = recent[-1] - recent[-6]
-
-    if long == 0:
-        return "WAIT", 0
-
-    distance = abs(short - long) / abs(long) * 100000
-
-    confidence = 50
-
-    if short > long:
-        confidence += min(25, distance * 2)
-
-    elif short < long:
-        confidence += min(25, distance * 2)
-
-    if momentum > 0:
-        confidence += 15
-
-    elif momentum < 0:
-        confidence += 15
-
-    confidence = max(0, min(99, round(confidence)))
-
-    if short > long and momentum > 0 and confidence >= MIN_CONFIDENCE:
-        return "CALL", confidence
-
-    if short < long and momentum < 0 and confidence >= MIN_CONFIDENCE:
-        return "PUT", confidence
-
-    return "WAIT", confidence
-
-
-def process_price(asset, price):
-    if not asset or price is None:
-        return
-
-    if asset not in PRICE_HISTORY:
-        PRICE_HISTORY[asset] = []
-
-    PRICE_HISTORY[asset].append(price)
-
-    # Keep memory small
-    PRICE_HISTORY[asset] = PRICE_HISTORY[asset][-200:]
-
-    signal, confidence = calculate_signal(asset)
-
-    STATE["signal"] = signal
-    STATE["confidence"] = confidence
-
-    if signal in ("CALL", "PUT"):
-        STATE["entry"] = price
-        STATE["entry_window"] = 12
-        STATE["message"] = "ENTRY WINDOW ACTIVE"
-    else:
-        STATE["message"] = "Waiting for high-confidence setup..."
-
-
-# ============================================================
-# AUTHENTICATION
-# ============================================================
-
-def authorized(req):
-    """
-    If RYU_FEED_TOKEN is configured, require it.
-
-    Accepted:
-      Authorization: Bearer YOUR_TOKEN
-    OR
-      X-RYU-TOKEN: YOUR_TOKEN
-    """
-
-    if not FEED_TOKEN:
-        return True
-
-    auth = req.headers.get("Authorization", "")
-
-    if auth.startswith("Bearer "):
-        token = auth[7:].strip()
-
-        if token == FEED_TOKEN:
-            return True
-
-    header_token = req.headers.get("X-RYU-TOKEN", "")
-
-    if header_token == FEED_TOKEN:
-        return True
-
-    # Also allow token in JSON body
-    try:
-        body = req.get_json(silent=True) or {}
-
-        if body.get("token") == FEED_TOKEN:
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-# ============================================================
-# HOME / DASHBOARD
-# ============================================================
-
-HTML = r"""
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RYU V2</title>
 
-<title>RYU V2 Signal Dashboard</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-<style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: #06110b;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+        }
 
-* {
-    box-sizing: border-box;
+        .top {
+            padding: 22px 18px 10px;
+            text-align: center;
+        }
+
+        .title {
+            font-size: 32px;
+            font-weight: 900;
+            letter-spacing: 3px;
+            color: #39ff88;
+            text-shadow: 0 0 15px #19ff70;
+        }
+
+        .subtitle {
+            margin-top: 5px;
+            color: #9bb8a5;
+            font-size: 14px;
+            letter-spacing: 1px;
+        }
+
+        .feed {
+            margin: 15px auto;
+            width: fit-content;
+            padding: 8px 16px;
+            border: 1px solid #263c2e;
+            border-radius: 20px;
+            color: #ff5555;
+            background: #0b1710;
+            font-weight: bold;
+        }
+
+        .grid {
+            width: min(1000px, 94%);
+            margin: 20px auto;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 14px;
+        }
+
+        .card {
+            background: #0b1911;
+            border: 1px solid #193a25;
+            border-radius: 14px;
+            padding: 18px;
+            min-height: 105px;
+            box-shadow: 0 0 20px rgba(0, 255, 100, 0.05);
+        }
+
+        .label {
+            color: #86a994;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .value {
+            margin-top: 10px;
+            font-size: 25px;
+            font-weight: 800;
+        }
+
+        .signal {
+            grid-column: span 3;
+            text-align: center;
+            min-height: 150px;
+        }
+
+        .signal .value {
+            font-size: 48px;
+            color: #ffd84d;
+        }
+
+        .button {
+            display: block;
+            width: min(400px, 90%);
+            margin: 25px auto;
+            padding: 15px;
+            border: 0;
+            border-radius: 10px;
+            background: #19d968;
+            color: #001b0a;
+            font-size: 16px;
+            font-weight: 900;
+            cursor: pointer;
+        }
+
+        .status {
+            width: min(1000px, 94%);
+            margin: 20px auto;
+            padding: 16px;
+            background: #08150d;
+            border: 1px solid #193a25;
+            border-radius: 12px;
+        }
+
+        .live {
+            color: #39ff88;
+        }
+
+        .dead {
+            color: #ff5555;
+        }
+
+        @media (max-width: 700px) {
+            .grid {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .signal {
+                grid-column: span 2;
+            }
+
+            .title {
+                font-size: 25px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="top">
+    <div class="title">RYU V2</div>
+    <div class="subtitle">SIGNAL INTELLIGENCE DASHBOARD</div>
+    <div id="feed" class="feed">Feed: DISCONNECTED</div>
+</div>
+
+<div class="grid">
+
+    <div class="card">
+        <div class="label">Asset</div>
+        <div id="asset" class="value">EURUSD_otc</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Price</div>
+        <div id="price" class="value">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Confidence</div>
+        <div id="confidence" class="value">0%</div>
+    </div>
+
+    <div class="card signal">
+        <div class="label">Signal</div>
+        <div id="signal" class="value">WAIT</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Entry</div>
+        <div id="entry" class="value">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Entry Window</div>
+        <div id="entry_window" class="value">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Candles</div>
+        <div id="candles" class="value">0</div>
+    </div>
+
+</div>
+
+<button class="button" onclick="refreshSignal()">REFRESH SIGNAL</button>
+
+<div class="status">
+    <div class="label">Live State</div>
+    <div id="liveState" class="value">Waiting for feed...</div>
+</div>
+
+<script>
+async function refreshSignal() {
+    try {
+        const response = await fetch("/api/state", {
+            cache: "no-store"
+        });
+
+        const data = await response.json();
+
+        document.getElementById("asset").textContent =
+            data.asset || "EURUSD_otc";
+
+        document.getElementById("price").textContent =
+            data.price !== null && data.price !== undefined
+                ? data.price
+                : "--";
+
+        document.getElementById("confidence").textContent =
+            (data.confidence || 0) + "%";
+
+        document.getElementById("signal").textContent =
+            data.signal || "WAIT";
+
+        document.getElementById("entry").textContent =
+            data.entry !== null && data.entry !== undefined
+                ? data.entry
+                : "--";
+
+        document.getElementById("entry_window").textContent =
+            data.entry_window
+                ? data.entry_window + "s"
+                : "--";
+
+        document.getElementById("candles").textContent =
+            data.candles || 0;
+
+        const feed = document.getElementById("feed");
+        const liveState = document.getElementById("liveState");
+
+        if (data.feed === "LIVE") {
+            feed.textContent = "Feed: LIVE";
+            feed.className = "feed live";
+            liveState.textContent = "LIVE";
+            liveState.className = "value live";
+        } else {
+            feed.textContent = "Feed: DISCONNECTED";
+            feed.className = "feed dead";
+            liveState.textContent = "Waiting for feed...";
+            liveState.className = "value dead";
+        }
+
+    } catch (error) {
+        document.getElementById("feed").textContent =
+            "Feed: DISCONNECTED";
+    }
 }
 
-body {
-    margin: 0;
-    background: #06110b;
-    color: white;
-    font-family: Arial, Helvetica, sans-serif;
-}
+refreshSignal();
 
-.header {
-    padding: 18px;
-    background: linear-gradient(90deg,#07150c,#0d2a17,#07150c);
-    border-bottom: 2px solid #19ff72;
-    text-align: center;
-}
+setInterval(refreshSignal, 1000);
+</script>
 
-.logo {
-    font-size: 30px;
-    font-weight: 900;
-    color: #19ff72;
-    letter-spacing: 3px;
-}
+</body>
+</html>
+"""
 
-.subtitle {
-    color: #9affba;
-    font-size: 12px;
-    margin-top: 5px;
-    letter-spacing: 2px;
-}
 
-.statusbar {
-    display: flex;
-    gap: 10px;
-    padding: 12px;
-    overflow-x: auto;
-    background: #08170d;
-}
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
-.status {
-    min-width: 130px;
-    padding: 10px;
-    border: 1px solid #174d2b;
-    border-radius: 8px;
-    background: #0b2113;
-}
 
-.status-title {
-    color: #80a88d;
-    font-size: 11px;
-}
+@app.route("/api/state")
+def api_state():
+    # Mark feed disconnected if no update for 15 seconds.
+    if STATE["last_update"]:
+        age = time.time() - STATE["last_update"]
 
-.status-value {
-    font-size: 16px;
-    font-weight: bold;
-    margin-top: 4px;
-}
+        if age > 15:
+            STATE["feed"] = "DISCONNECTED"
 
-.live {
-    color: #19ff72;
-}
+    return jsonify(STATE)
 
-.dead {
-    color: #ff4d4d;
-}
 
-.container {
-    max-width: 1100px;
-    margin: auto;
-    padding: 15px;
-}
+@app.route("/api/feed", methods=["POST"])
+def api_feed():
+    try:
+        data = request.get_json(silent=True)
 
-.card {
-    background: linear-gradient(145deg,#0b2113,#07150c);
-    border: 1px solid #19562f;
-    border-radius: 14px;
-    padding: 18px;
-    margin-bottom: 15px;
-    box-shadow: 0 0 25px rgba(0,255,100,.06);
-}
+        if not data:
+            return jsonify({
+                "ok": False,
+                "error": "No JSON data received"
+            }), 400
 
-.asset {
-    color: #9affba;
-    font-size: 14px;
-}
+        # Accept common field names.
+        asset = (
+            data.get("asset")
+            or data.get("symbol")
+            or data.get("pair")
+        )
 
-.price {
-    font-size: 38px;
-    font-weight: 900;
-    margin-top: 8px;
-}
+        price = (
+            data.get("price")
+            if data.get("price") is not None
+            else data.get("close")
+        )
 
-.signal-box {
-    text-align: center;
-    padding: 25px;
-    border-radius: 12px;
-    background: #061
+        candles = data.get("candles")
+
+        if asset:
+            STATE["asset"] = str(asset)
+
+        if price is not None:
+            STATE["price"] = price
+
+        if candles is not None:
+            try:
+                STATE["candles"] = int(candles)
+            except (ValueError, TypeError):
+                pass
+
+        # Optional signal data from bridge/engine.
+        if data.get("signal") is not None:
+            STATE["signal"] = str(data["signal"]).upper()
+
+        if data.get("confidence") is not None:
+            try:
+                STATE["confidence"] = int(float(data["confidence"]))
+            except (ValueError, TypeError):
+                pass
+
+        if data.get("entry") is not None:
+            STATE["entry"] = data["entry"]
+
+        if data.get("entry_window") is not None:
+            try:
+                STATE["entry_window"] = int(
+                    float(data["entry_window"])
+                )
+            except (ValueError, TypeError):
+                pass
+
+        STATE["feed"] = "LIVE"
+        STATE["last_update"] = time.time()
+
+        return jsonify({
+            "ok": True,
+            "state": STATE
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc)
+        }), 500
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "RYU V2",
+        "feed": STATE["feed"]
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
